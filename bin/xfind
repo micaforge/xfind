@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""xfind — cross-section search across your own file base.
+
+Give it query terms; it returns ranked filepaths with context snippets —
+a cross-section of relevant information across notes, skills, goals,
+projects, and docs. Built for regular use: fast, stdlib only, no network.
+
+Usage:
+    xfind "vector tracing palette" [--limit 8] [--paths-only]
+
+Search roots (first one wins):
+    1. --roots flag (colon-separated)
+    2. XFIND_ROOTS environment variable (colon-separated)
+    3. Built-in defaults below — edit to match your own layout.
+"""
+import argparse
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+# Edit these to match your own file layout, or set XFIND_ROOTS instead.
+DEFAULT_ROOTS = [
+    f"{HOME}/MEMORY.md",
+    f"{HOME}/notes",
+    f"{HOME}/docs",
+    f"{HOME}/workspace/skills",
+    f"{HOME}/workspace/projects",
+    f"{HOME}/workspace/reference",
+]
+SKIP_DIRS = {
+    "__pycache__", "node_modules", ".git", ".space-build",
+    ".space-build-cvm", "venv", ".venv", "assets",
+}
+SKIP_FILES = set()  # e.g. {"noisy-server.log"}
+TEXT_EXTS = {
+    ".md", ".txt", ".json", ".py", ".sh", ".yaml", ".yml", ".toml",
+    ".html", ".css", ".ts", ".tsx", ".js", ".sql",
+}
+MAX_BYTES = 400_000  # skip or truncate huge files (event logs, bundles)
+
+
+def iter_files(roots):
+    seen = set()
+    for root in roots:
+        root = os.path.expanduser(root)
+        if os.path.isfile(root):
+            if root not in seen:
+                seen.add(root)
+                yield root
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d not in SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if fn in SKIP_FILES or fn.startswith("."):
+                    continue
+                ext = os.path.splitext(fn)[1].lower()
+                if ext and ext not in TEXT_EXTS:
+                    continue
+                p = os.path.join(dirpath, fn)
+                if p not in seen:
+                    seen.add(p)
+                    yield p
+
+
+def read_text(path):
+    try:
+        if os.path.getsize(path) > MAX_BYTES:
+            return None
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def score_file(path, terms):
+    """(score, hits) — filename matches weigh 3x, capped hit count."""
+    text = read_text(path)
+    if not text:
+        return 0, []
+    low = text.lower()
+    base = os.path.basename(path).lower()
+    score = 0
+    for t in terms:
+        if t in base:
+            score += 3
+        if t in low:
+            score += 1
+    if score == 0:
+        return 0, []
+    # snippet hits: lines matching any term
+    hits = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(t in ll for t in terms):
+            hits.append((i, line.strip()))
+            if len(hits) >= 40:
+                break
+    # cap snippet output later; score gets a small boost for density
+    score += min(len(hits), 5) * 0.2
+    return score, (lines, hits)
+
+
+def snippets(lines, hits, per_file=3, ctx=2):
+    out = []
+    used = set()
+    for i, _ in hits:
+        if any(abs(i - u) <= ctx * 2 + 1 for u in used):
+            continue
+        used.add(i)
+        lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
+        chunk = "\n".join(
+            ("> " if j == i else "  ") + lines[j].strip() for j in range(lo, hi)
+            if lines[j].strip())
+        if chunk:
+            out.append(chunk)
+        if len(out) >= per_file:
+            break
+    return out
+
+
+def resolve_roots(flag_roots):
+    if flag_roots:
+        return flag_roots.split(":")
+    env_roots = os.environ.get("XFIND_ROOTS")
+    if env_roots:
+        return env_roots.split(":")
+    return DEFAULT_ROOTS
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Cross-section search over your file base.")
+    ap.add_argument("query", help="query terms")
+    ap.add_argument("--limit", type=int, default=10)
+    ap.add_argument("--paths-only", action="store_true")
+    ap.add_argument("--roots", default=None, help="colon-separated roots")
+    args = ap.parse_args()
+
+    terms = [t.lower() for t in re.findall(r"[a-z0-9]+(?:[-_][a-z0-9]+)*",
+                                           args.query.lower())]
+    terms = [t for t in terms if len(t) > 1]
+    if not terms:
+        print("no usable terms", file=sys.stderr)
+        return 1
+    roots = resolve_roots(args.roots)
+
+    scored = []
+    for path in iter_files(roots):
+        s, data = score_file(path, terms)
+        if s > 0:
+            scored.append((s, path, data))
+    scored.sort(key=lambda x: -x[0])
+    if not scored:
+        print("no matches")
+        return 0
+
+    for s, path, (lines, hits) in scored[:args.limit]:
+        short = path.replace(HOME, "~")
+        if args.paths_only:
+            print(short)
+            continue
+        print(f"\n## {short}  (score {s:.1f}, {len(hits)} hits)")
+        for snip in snippets(lines, hits):
+            print(snip)
+            print("  ...")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
