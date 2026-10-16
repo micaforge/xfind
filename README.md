@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="xfind logo" width="120"/>
+<img src="assets/icon.png" alt="xfind logo" width="120"/>
 
 # xfind
 
